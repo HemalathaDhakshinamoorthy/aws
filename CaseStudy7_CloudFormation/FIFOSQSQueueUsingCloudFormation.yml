@@ -1,0 +1,17 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Create FIFO SQS Queue
+
+Resources:
+
+  MyFIFOQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: my-message-queue.fifo
+      FifoQueue: true
+      ContentBasedDeduplication: true
+
+Outputs:
+
+  QueueURL:
+    Description: FIFO Queue URL
+    Value: !Ref MyFIFOQueue
