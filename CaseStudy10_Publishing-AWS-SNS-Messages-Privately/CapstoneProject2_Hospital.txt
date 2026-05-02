@@ -1,0 +1,339 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: >
+  Secure Hospital Patient Notification System
+  using VPC, EC2, SNS, S3, KMS and VPC Endpoint
+
+Parameters:
+
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Existing EC2 KeyPair
+
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+
+Resources:
+
+# =========================================================
+# VPC
+# =========================================================
+
+  HospitalVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: HospitalVPC
+
+# =========================================================
+# INTERNET GATEWAY
+# =========================================================
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref HospitalVPC
+      InternetGatewayId: !Ref InternetGateway
+
+# =========================================================
+# SUBNETS
+# =========================================================
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref HospitalVPC
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: PublicSubnet
+
+  PrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref HospitalVPC
+      CidrBlock: 10.0.2.0/24
+      MapPublicIpOnLaunch: false
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: PrivateSubnet
+
+# =========================================================
+# ROUTE TABLES
+# =========================================================
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref HospitalVPC
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRouteAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet
+
+# =========================================================
+# ELASTIC IP
+# =========================================================
+
+  NatEIP:
+    Type: AWS::EC2::EIP
+    DependsOn: AttachGateway
+    Properties:
+      Domain: vpc
+
+# =========================================================
+# NAT GATEWAY
+# =========================================================
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEIP.AllocationId
+      SubnetId: !Ref PublicSubnet
+
+# =========================================================
+# PRIVATE ROUTE TABLE
+# =========================================================
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref HospitalVPC
+
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  PrivateSubnetAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      SubnetId: !Ref PrivateSubnet
+
+# =========================================================
+# SECURITY GROUPS
+# =========================================================
+
+  EC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: EC2 Security Group
+      VpcId: !Ref HospitalVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+
+# =========================================================
+# KMS KEY
+# =========================================================
+
+  HospitalKMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: KMS Key for SNS and S3 Encryption
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: EnableIAMPermissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action: 'kms:*'
+            Resource: '*'
+
+# =========================================================
+# S3 BUCKET
+# =========================================================
+
+  PatientReportsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !Ref HospitalKMSKey
+
+      VersioningConfiguration:
+        Status: Enabled
+
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+# =========================================================
+# SNS TOPIC
+# =========================================================
+
+  PatientNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: PatientNotifications
+      KmsMasterKeyId: !Ref HospitalKMSKey
+
+# =========================================================
+# IAM ROLE FOR EC2
+# =========================================================
+
+  EC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+
+      Policies:
+        - PolicyName: HospitalPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref PatientNotificationTopic
+
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource:
+                  - !Sub ${PatientReportsBucket.Arn}/*
+                  - !GetAtt PatientReportsBucket.Arn
+
+              - Effect: Allow
+                Action:
+                  - kms:Encrypt
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                Resource: !GetAtt HospitalKMSKey.Arn
+
+# =========================================================
+# INSTANCE PROFILE
+# =========================================================
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref EC2Role
+
+# =========================================================
+# EC2 INSTANCE
+# =========================================================
+
+  HospitalEC2:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t3.micro
+      ImageId: !Ref LatestAmiId
+      KeyName: !Ref KeyPairName
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      SubnetId: !Ref PrivateSubnet
+      SecurityGroupIds:
+        - !Ref EC2SecurityGroup
+
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          yum update -y
+
+          dnf install python3 -y
+
+          pip3 install boto3
+
+          cat <<EOF > /home/ec2-user/publish.py
+          import boto3
+
+          sns = boto3.client('sns', region_name='${AWS::Region}')
+
+          response = sns.publish(
+              TopicArn='${PatientNotificationTopic}',
+              Subject='Patient Report Notification',
+              Message='Your medical report is ready. Login securely to view it.'
+          )
+
+          print(response)
+          EOF
+
+          chmod +x /home/ec2-user/publish.py
+
+# =========================================================
+# SNS VPC ENDPOINT
+# =========================================================
+
+  SNSVPCEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref HospitalVPC
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.sns
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+
+      SubnetIds:
+        - !Ref PrivateSubnet
+
+      SecurityGroupIds:
+        - !Ref EC2SecurityGroup
+
+# =========================================================
+# OUTPUTS
+# =========================================================
+
+Outputs:
+
+  VPCId:
+    Description: VPC ID
+    Value: !Ref HospitalVPC
+
+  SNSTopicArn:
+    Description: SNS Topic ARN
+    Value: !Ref PatientNotificationTopic
+
+  S3Bucket:
+    Description: S3 Bucket Name
+    Value: !Ref PatientReportsBucket
+
+  EC2InstanceId:
+    Description: EC2 Instance ID
+    Value: !Ref HospitalEC2
